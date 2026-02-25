@@ -1,0 +1,57 @@
+name: OMIE DAM Update
+
+permissions:
+  contents: write
+
+concurrency:
+  group: omie-dam-update
+  cancel-in-progress: false
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Run twice to cover Lisbon DST changes; job exits unless local Lisbon time is 15:30.
+    - cron: "30 14 * * *"
+    - cron: "30 15 * * *"
+
+jobs:
+  update-omie-dam:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Guard Lisbon 15:30
+        run: |
+          NOW_LISBON="$(TZ=Europe/Lisbon date +%H:%M)"
+          echo "Lisbon time: ${NOW_LISBON}"
+          if [ "${NOW_LISBON}" != "15:30" ]; then
+            echo "Skipping: not 15:30 in Europe/Lisbon"
+            exit 0
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run OMIE DAM pipeline
+        run: |
+          python omie_dam_pipeline.py --start 2023-01-01
+
+      - name: Commit updated data (optional)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/omie_dam_prices.parquet data/omie_dam_prices.csv || true
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git commit -m "Update OMIE DAM prices"
+          git push

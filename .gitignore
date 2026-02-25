@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+
+# Local logs / artifacts
+*.log
+
+# Keep raw OMIE cache local; commit only consolidated outputs.
+data/raw/
+
+# Optional local virtualenvs
+.venv/
+venv/
