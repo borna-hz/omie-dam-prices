@@ -316,6 +316,158 @@ def write_outputs(df: pd.DataFrame, data_dir: Path) -> tuple[Path, Path]:
     return parquet_path, csv_path
 
 
+def _add_resolution_metadata(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        out = df.copy()
+        out["periods_in_session"] = pd.Series(dtype="Int64")
+        out["native_resolution"] = pd.Series(dtype="string")
+        return out
+
+    out = df.copy()
+    counts = out.groupby("session_date")["period"].transform("nunique").astype("Int64")
+    out["periods_in_session"] = counts
+    out["native_resolution"] = out["periods_in_session"].apply(
+        lambda n: "15m" if pd.notna(n) and int(n) > 25 else "1h"
+    )
+    return out
+
+
+def build_15m_dataset(df_native: pd.DataFrame) -> pd.DataFrame:
+    df = _add_resolution_metadata(df_native)
+    if df.empty:
+        return pd.DataFrame(
+            columns=[
+                "session_date",
+                "hour",
+                "quarter_in_hour",
+                "period_15m",
+                "price_pt_eur_mwh",
+                "price_es_eur_mwh",
+                "source_filename",
+                "source_kind",
+            ]
+        )
+
+    rows: list[dict[str, object]] = []
+    for row in df.itertuples(index=False):
+        session_date = row.session_date
+        period = int(row.period)
+        if row.native_resolution == "15m":
+            hour = ((period - 1) // 4) + 1
+            quarter_in_hour = ((period - 1) % 4) + 1
+            rows.append(
+                {
+                    "session_date": session_date,
+                    "hour": hour,
+                    "quarter_in_hour": quarter_in_hour,
+                    "period_15m": period,
+                    "price_pt_eur_mwh": row.price_pt_eur_mwh,
+                    "price_es_eur_mwh": row.price_es_eur_mwh,
+                    "source_filename": row.source_filename,
+                    "source_kind": "native_15m",
+                }
+            )
+        else:
+            for quarter_in_hour in range(1, 5):
+                rows.append(
+                    {
+                        "session_date": session_date,
+                        "hour": period,
+                        "quarter_in_hour": quarter_in_hour,
+                        "period_15m": ((period - 1) * 4) + quarter_in_hour,
+                        "price_pt_eur_mwh": row.price_pt_eur_mwh,
+                        "price_es_eur_mwh": row.price_es_eur_mwh,
+                        "source_filename": row.source_filename,
+                        "source_kind": "expanded_from_1h",
+                    }
+                )
+
+    out = pd.DataFrame.from_records(rows)
+    out["hour"] = pd.to_numeric(out["hour"], errors="coerce").astype("Int64")
+    out["quarter_in_hour"] = pd.to_numeric(out["quarter_in_hour"], errors="coerce").astype("Int64")
+    out["period_15m"] = pd.to_numeric(out["period_15m"], errors="coerce").astype("Int64")
+    out["price_pt_eur_mwh"] = pd.to_numeric(out["price_pt_eur_mwh"], errors="coerce")
+    out["price_es_eur_mwh"] = pd.to_numeric(out["price_es_eur_mwh"], errors="coerce")
+    out = out.sort_values(["session_date", "period_15m"]).reset_index(drop=True)
+    return out
+
+
+def build_1h_dataset(df_native: pd.DataFrame) -> pd.DataFrame:
+    df = _add_resolution_metadata(df_native)
+    if df.empty:
+        return pd.DataFrame(
+            columns=[
+                "session_date",
+                "hour",
+                "price_pt_eur_mwh",
+                "price_es_eur_mwh",
+                "source_filename",
+                "source_kind",
+            ]
+        )
+
+    native_1h = df[df["native_resolution"] == "1h"].copy()
+    native_1h["hour"] = pd.to_numeric(native_1h["period"], errors="coerce").astype("Int64")
+    native_1h["source_kind"] = "native_1h"
+    native_1h = native_1h[
+        [
+            "session_date",
+            "hour",
+            "price_pt_eur_mwh",
+            "price_es_eur_mwh",
+            "source_filename",
+            "source_kind",
+        ]
+    ]
+
+    native_15m = df[df["native_resolution"] == "15m"].copy()
+    if native_15m.empty:
+        combined = native_1h
+    else:
+        native_15m["hour"] = (
+            (pd.to_numeric(native_15m["period"], errors="coerce").astype("Int64") - 1) // 4
+        ) + 1
+        agg = (
+            native_15m.groupby(["session_date", "hour"], as_index=False)
+            .agg(
+                price_pt_eur_mwh=("price_pt_eur_mwh", "mean"),
+                price_es_eur_mwh=("price_es_eur_mwh", "mean"),
+                source_filename=("source_filename", "first"),
+            )
+            .sort_values(["session_date", "hour"])
+        )
+        agg["source_kind"] = "avg_of_4x15m"
+        combined = pd.concat([native_1h, agg], ignore_index=True)
+
+    # If both exist for the same hour (unexpected overlap), prefer avg_of_4x15m.
+    combined["_source_priority"] = combined["source_kind"].map(
+        {"native_1h": 1, "avg_of_4x15m": 2}
+    ).fillna(0)
+    combined = combined.sort_values(
+        ["session_date", "hour", "_source_priority"]
+    ).drop_duplicates(["session_date", "hour"], keep="last")
+    combined = combined.sort_values(["session_date", "hour"]).reset_index(drop=True)
+    return combined[
+        [
+            "session_date",
+            "hour",
+            "price_pt_eur_mwh",
+            "price_es_eur_mwh",
+            "source_filename",
+            "source_kind",
+        ]
+    ]
+
+
+def write_named_outputs(df: pd.DataFrame, data_dir: Path, stem: str) -> tuple[Path, Path]:
+    data_dir.mkdir(parents=True, exist_ok=True)
+    parquet_path = data_dir / f"{stem}.parquet"
+    csv_path = data_dir / f"{stem}.csv"
+    df.to_parquet(parquet_path, index=False)
+    df.to_csv(csv_path, index=False)
+    return parquet_path, csv_path
+
+
 def main() -> int:
     args = parse_args()
     configure_logging(args.log_level)
@@ -367,8 +519,18 @@ def main() -> int:
 
     df = consolidate_frames(frames)
     parquet_path, csv_path = write_outputs(df, data_dir)
-    logging.info("Wrote %s rows to %s", len(df), parquet_path)
+    logging.info("Wrote native consolidated dataset (%s rows) to %s", len(df), parquet_path)
     logging.info("Wrote CSV copy to %s", csv_path)
+
+    df_15m = build_15m_dataset(df)
+    p15_parquet, p15_csv = write_named_outputs(df_15m, data_dir, "omie_dam_prices_15m")
+    logging.info("Wrote 15m dataset (%s rows) to %s", len(df_15m), p15_parquet)
+    logging.info("Wrote 15m CSV copy to %s", p15_csv)
+
+    df_1h = build_1h_dataset(df)
+    p1h_parquet, p1h_csv = write_named_outputs(df_1h, data_dir, "omie_dam_prices_1h")
+    logging.info("Wrote 1h dataset (%s rows) to %s", len(df_1h), p1h_parquet)
+    logging.info("Wrote 1h CSV copy to %s", p1h_csv)
     return 0
 
 
